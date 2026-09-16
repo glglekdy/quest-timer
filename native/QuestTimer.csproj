@@ -7,7 +7,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>Quest Timer</AssemblyName>
     <RootNamespace>QuestTimer</RootNamespace>
-    <Version>1.4.2</Version>
+    <Version>1.4.3</Version>
     <ApplicationIcon>../build/icon.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>

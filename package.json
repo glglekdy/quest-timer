@@ -1,6 +1,6 @@
 {
   "name": "quest-timer",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "퀘스트를 깨듯 공부하는 집중 타이머",
   "main": "main.js",
   "private": true,
