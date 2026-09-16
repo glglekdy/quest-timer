@@ -22,6 +22,34 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const ready = new Promise((resolve) => ipcMain.once('renderer:ready', resolve));
 require(path.join(ROOT, 'main.js'));
 
+/**
+ * 두 창 가운데 a 가 화면에서 더 앞에 놓였는가. Electron 에는 창 겹침 순서를
+ * 묻는 길이 없어 Windows 에 직접 묻는다 - EnumWindows 는 맨 앞 창부터 돌려준다.
+ */
+function isInFront(a, b) {
+  const handle = (w) => {
+    const buf = w.getNativeWindowHandle();
+    return buf.length >= 8 ? buf.readBigInt64LE().toString() : String(buf.readInt32LE());
+  };
+  const script = path.join(os.tmpdir(), 'quest-widget-zorder.ps1');
+  fs.writeFileSync(script, `param([Int64]$a, [Int64]$b)
+Add-Type @'
+using System; using System.Runtime.InteropServices; using System.Collections.Generic;
+public static class ZOrder {
+  delegate bool EnumProc(IntPtr h, IntPtr l);
+  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc f, IntPtr l);
+  public static List<long> List() { var r = new List<long>(); EnumWindows((h, l) => { r.Add(h.ToInt64()); return true; }, IntPtr.Zero); return r; }
+}
+'@
+$order = [ZOrder]::List()
+$order.IndexOf($a) -lt $order.IndexOf($b)
+`);
+  const out = require('node:child_process').execFileSync('powershell',
+    ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, handle(a), handle(b)],
+    { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 30000 });
+  return out.trim() === 'True';
+}
+
 /** 지금 떠 있는 위젯 창. 없으면 null. */
 function widgetWindow() {
   return BrowserWindow.getAllWindows()
@@ -88,6 +116,20 @@ app.whenReady().then(async () => {
 
   fs.mkdirSync(path.join(ROOT, 'shots'), { recursive: true });
   fs.writeFileSync(path.join(ROOT, 'shots/widget.png'), (await widget.webContents.capturePage()).toPNG());
+
+  // 다른 앱의 '항상 위' 창이 나중에 앞으로 나와 위젯을 덮어도, 곧 위젯이 다시 맨 앞으로 온다
+  const spot = widget.getBounds();
+  const cover = new BrowserWindow({ x: spot.x - 20, y: spot.y - 20, width: spot.width + 40,
+    height: spot.height + 40, show: false, frame: false, alwaysOnTop: true, skipTaskbar: true });
+  await cover.loadURL('data:text/html,<body style="background:%23400"></body>');
+  cover.setIgnoreMouseEvents(true); // 검사하는 동안 누가 눌러도 흐트러지지 않게
+  cover.show();
+  cover.focus();
+  await wait(1500);
+  assert.ok(isInFront(widget, cover), '다른 항상 위 창에 덮여도 1초 안에 다시 맨 앞으로 온다');
+  assert.equal(widget.isFocused(), false, '맨 앞으로 오면서 포커스를 뺏지 않는다');
+  assert.deepEqual(widget.getBounds(), spot, '다시 올리는 동안 자리와 크기는 그대로다');
+  cover.destroy();
 
   // 휠을 올리면 커진다. 오른쪽 아래에 놓인 위젯이니 오른쪽 아래 모서리는 제자리다.
   const wheelUp = () => widget.webContents.sendInputEvent(

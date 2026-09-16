@@ -160,6 +160,12 @@ let widgetScale = 1;
 let scene = { mode: 'idle', enabled: true };  // 렌더러가 보내온 마지막 장면
 let dragFrom = null;                          // 끌기 시작할 때의 마우스와 창 위치
 let syncTimer = null;
+let pinTimer = null;                          // 위젯을 맨 앞으로 다시 올리는 타이머
+
+// '항상 위' 창끼리는 나중에 앞으로 나온 쪽이 덮는다. 다른 앱의 항상 위 창
+// (동영상 플레이어의 작은 창 같은 것)이 위젯을 가리면 스스로는 올라오지 못하므로
+// 떠 있는 동안 이만큼마다 다시 맨 앞으로 올린다. 포커스는 뺏지 않는다.
+const PIN_EVERY_MS = 1000;
 
 /** 이 배율일 때 창 크기 */
 function widgetSize(scale) {
@@ -248,11 +254,16 @@ function createWidget() {
     },
   });
 
+  // 항상 위 창 가운데서도 가장 높은 층. 앱 창의 '항상 위에 띄우기'('floating')보다 위다.
+  widget.setAlwaysOnTop(true, 'screen-saver');
   widget.removeMenu();
   // 글자와 링은 배율 1 에 맞춰 그렸으니 페이지를 통째로 확대해 창에 맞춘다
   widget.webContents.on('did-finish-load', () => widget.webContents.setZoomFactor(widgetScale));
   widget.loadFile(path.join(__dirname, 'src', 'widget.html'));
-  widget.on('closed', () => { widget = null; });
+  widget.on('closed', () => {
+    widget = null;
+    unpinWidget();
+  });
   return widget;
 }
 
@@ -304,12 +315,34 @@ function widgetWanted() {
 
 function syncWidget() {
   if (!widgetWanted()) {
+    unpinWidget();
     if (widget && !widget.isDestroyed()) widget.hide();
     return;
   }
   if (!widget || widget.isDestroyed()) createWidget();
   paintWidget();
   if (!widget.isVisible()) widget.showInactive(); // 뜨면서 앞의 창을 뺏지 않는다
+  pinWidget();
+}
+
+/**
+ * 떠 있는 동안 위젯을 맨 앞에 붙들어 둔다. 같은 층으로 한 번 더 항상 위를
+ * 걸면 Windows 가 그 창을 항상 위 창들 가운데 맨 앞으로 다시 올린다.
+ * moveTop() 은 쓰지 않는다 - 배율이 100% 가 아닌 화면에서 창 자리를 흔들 수 있다.
+ */
+function pinWidget() {
+  if (!widget || widget.isDestroyed()) return;
+  widget.setAlwaysOnTop(true, 'screen-saver');
+  if (pinTimer) return;
+  pinTimer = setInterval(() => {
+    if (!widget || widget.isDestroyed() || !widget.isVisible()) return unpinWidget();
+    widget.setAlwaysOnTop(true, 'screen-saver');
+  }, PIN_EVERY_MS);
+}
+
+function unpinWidget() {
+  if (pinTimer) clearInterval(pinTimer);
+  pinTimer = null;
 }
 
 /**
