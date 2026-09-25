@@ -9,6 +9,9 @@ const { app, BrowserWindow, ipcMain, net, Notification, powerMonitor, screen, sh
 const { autoUpdater } = require('electron-updater');
 const path = require('node:path');
 const fs = require('node:fs');
+const zlib = require('node:zlib');
+const crypto = require('node:crypto');
+const { spawn } = require('node:child_process');
 const { registerWindowsNotifications } = require('./windows-notifications');
 
 // Windows 는 이 이름으로 창을 앱에 묶는다. 한 번 엉뚱한 exe 와 묶이면 그 기억이
@@ -469,21 +472,198 @@ function initUpdater() {
   checkTimer = setInterval(checkUpdate, CHECK_EVERY_MS);
 }
 
-function checkUpdate() {
+function errorText(err) {
+  return (err && err.message) ? err.message : String(err);
+}
+
+async function checkUpdate() {
   if (!app.isPackaged) return;
   // 이미 받아둔 버전이 있으면 다시 확인할 필요가 없다
-  if (update.status === 'downloading' || update.status === 'ready') return;
-  autoUpdater.checkForUpdates().catch((err) => {
-    pushUpdate({ status: 'error', error: (err && err.message) ? err.message : String(err) });
-  });
+  if (update.status === 'checking' || update.status === 'downloading' || update.status === 'ready') return;
+  pushUpdate({ status: 'checking', error: null });
+
+  const found = await findAppPatch();
+  if (found === 'current') return pushUpdate({ status: 'current', percent: 0 });
+  if (found) {
+    appPatch = found;
+    pushUpdate({ status: 'available', version: found.version, percent: 0 });
+    if (wantAutoDownload) downloadUpdate();
+    return;
+  }
+
+  // 앱만 갈아 끼울 수 없으면 전처럼 설치 파일을 통째로 받는다
+  appPatch = null;
+  autoUpdater.checkForUpdates().catch((err) => pushUpdate({ status: 'error', error: errorText(err) }));
 }
 
 function downloadUpdate() {
   if (!app.isPackaged) return;
-  autoUpdater.downloadUpdate().catch((err) => {
-    pushUpdate({ status: 'error', error: (err && err.message) ? err.message : String(err) });
-  });
+  if (appPatch) {
+    downloadAppPatch().catch((err) => pushUpdate({ status: 'error', error: errorText(err) }));
+    return;
+  }
+  autoUpdater.downloadUpdate().catch((err) => pushUpdate({ status: 'error', error: errorText(err) }));
 }
+
+// ── 앱만 갈아 끼우는 업데이트 ────────────────────────────────
+// 설치 파일은 100MB 가 넘지만 대부분이 Electron 런타임이고, 우리 코드와 글꼴은
+// resources/app.asar 5MB 남짓이다. 런타임이 그대로인 판이면 app.asar 만 받아
+// 두었다가 앱이 꺼진 뒤 바꿔 끼운다. 쓰이는 중인 app.asar 는 Windows 가 잠가두므로
+// 꺼진 다음이어야 한다.
+//
+// 릴리스에는 scripts/release.js 가 app-update.json 과 app.asar.gz 를 함께 올린다.
+// 아래 경우에는 앱만 바꿀 수 없어 설치 파일(electron-updater)로 넘어간다.
+//   - 새 판의 Electron 주 버전이 지금과 다르다
+//   - 최신 릴리스에 app-update.json 이 없다 (이 방식 이전에 올린 판)
+//   - 설치 폴더에 쓸 수 없다 (Program Files 에 설치한 경우 등)
+const LATEST_URL = 'https://api.github.com/repos/glglekdy/quest-timer/releases/latest';
+const PATCH_MANIFEST = 'app-update.json';
+
+let appPatch = null;        // { version, url, size, sha512 } - 받을 것
+let appPatchSwapped = false; // 바꿔 끼울 일꾼을 이미 띄웠다
+
+function patchFile() {
+  return path.join(process.resourcesPath, 'app.next'); // .asar 로 끝나면 Electron 이 아카이브로 읽으려 든다
+}
+
+function electronMajor() {
+  return String(process.versions.electron).split('.')[0];
+}
+
+function canWriteResources() {
+  const probe = path.join(process.resourcesPath, 'write-probe.tmp');
+  try {
+    fs.writeFileSync(probe, '');
+    fs.unlinkSync(probe);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+async function fetchOk(url, timeoutMs) {
+  const res = await net.fetch(url, {
+    headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Quest-Timer/' + app.getVersion() },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res;
+}
+
+/**
+ * 앱만 바꿔서 올라갈 수 있는 새 판. 이미 최신이면 'current'.
+ * 앱만으로는 안 되거나 알아보지 못했으면 null - 설치 파일 쪽에 맡긴다.
+ */
+async function findAppPatch() {
+  if (process.env.PORTABLE_EXECUTABLE_DIR) return null; // 휴대용은 켤 때마다 임시 폴더에 풀린다
+
+  try {
+    const release = await (await fetchOk(LATEST_URL, 10000)).json();
+    const assets = (release && release.assets) || [];
+    const manifestAsset = assets.find((a) => a.name === PATCH_MANIFEST);
+    if (!manifestAsset) return null;
+
+    const manifest = await (await fetchOk(manifestAsset.browser_download_url, 10000)).json();
+    if (Notes.compareVersions(manifest.version, app.getVersion()) <= 0) return 'current';
+    if (String(manifest.electron) !== electronMajor()) return null;
+
+    const file = assets.find((a) => a.name === manifest.file);
+    if (!file || !manifest.sha512) return null;
+    if (!canWriteResources()) return null;
+
+    return { version: manifest.version, url: file.browser_download_url, size: file.size, sha512: manifest.sha512 };
+  } catch (err) {
+    console.error('[updater] 앱 업데이트를 알아보지 못했습니다:', err.message);
+    return null;
+  }
+}
+
+async function downloadAppPatch() {
+  if (update.status === 'downloading' || update.status === 'ready') return;
+  const patch = appPatch;
+  pushUpdate({ status: 'downloading', version: patch.version, percent: 0 });
+
+  const res = await fetchOk(patch.url, 5 * 60 * 1000);
+  const total = Number(res.headers.get('content-length')) || patch.size || 0;
+  const reader = res.body.getReader();
+  const chunks = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(Buffer.from(value));
+    got += value.length;
+    if (total) pushUpdate({ percent: Math.min(99, Math.round((got / total) * 100)) });
+  }
+
+  const asar = zlib.gunzipSync(Buffer.concat(chunks));
+  const sha512 = crypto.createHash('sha512').update(asar).digest('base64');
+  if (sha512 !== patch.sha512) throw new Error('받은 파일이 올린 것과 다릅니다');
+
+  fs.writeFileSync(patchFile(), asar);
+  pushUpdate({ status: 'ready', version: patch.version, percent: 100 });
+}
+
+/**
+ * 앱이 꺼지길 기다렸다가 app.next 를 app.asar 자리에 옮기는 일꾼을 띄운다.
+ * 일꾼은 이 exe 를 Node 로 돌린 것이다 (ELECTRON_RUN_AS_NODE). 따로 셸이나
+ * 스크립트 엔진을 부르지 않으니 경로에 한글이 섞여도 괜찮다.
+ */
+function swapAppPatch(relaunch) {
+  if (appPatchSwapped || !appPatch || update.status !== 'ready') return;
+  appPatchSwapped = true;
+
+  const job = {
+    pid: process.pid,
+    from: patchFile(),
+    to: path.join(process.resourcesPath, 'app.asar'),
+    relaunch: relaunch ? process.execPath : null,
+  };
+  const worker = path.join(app.getPath('temp'), 'quest-timer-swap.js');
+  fs.writeFileSync(worker, SWAP_WORKER, 'utf8');
+
+  const env = Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' });
+  const child = spawn(process.execPath, [worker, JSON.stringify(job)], {
+    cwd: app.getPath('temp'), // resources 를 붙잡고 있지 않게
+    env,
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
+}
+
+// 일꾼 본문. 앱이 꺼진 뒤에 돌므로 app.asar 안의 어떤 것도 불러오지 않는다.
+const SWAP_WORKER = `'use strict';
+process.noAsar = true;
+const fs = require('fs');
+const { spawn } = require('child_process');
+const job = JSON.parse(process.argv[2]);
+
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+}
+
+let tries = 0;
+(function step() {
+  // 앱이 꺼졌어도 렌더러 같은 곁 프로세스가 잠깐 app.asar 를 쥐고 있을 수 있다
+  if (!alive(job.pid) || tries > 120) {
+    try {
+      fs.renameSync(job.from, job.to);
+    } catch (err) {
+      if (tries < 160) { tries++; return setTimeout(step, 250); }
+    }
+    if (job.relaunch) {
+      const env = Object.assign({}, process.env);
+      delete env.ELECTRON_RUN_AS_NODE;
+      spawn(job.relaunch, [], { detached: true, stdio: 'ignore', env }).unref();
+    }
+    return;
+  }
+  tries++;
+  setTimeout(step, 250);
+})();
+`;
 
 // electron-updater 는 받아둔 설치 파일을 캐시에 남긴다. 설치가 끝난 뒤에도
 // 그대로라서 100MB 가 넘는 파일이 놀고 있게 된다. 아직 설치하지 않은 새 버전만
@@ -509,7 +689,14 @@ function isNewerThanNow(version) {
 }
 
 function sweepUpdateCache() {
-  if (!app.isPackaged || !process.env.LOCALAPPDATA) return;
+  if (!app.isPackaged) return;
+  // 바꿔 끼우지 못하고 남은 app.next 도 치운다. 필요하면 다시 받는다.
+  try {
+    fs.rmSync(patchFile(), { force: true });
+  } catch (err) {
+    console.error('[updater] 받아둔 앱 파일을 치우지 못했습니다:', err.message);
+  }
+  if (!process.env.LOCALAPPDATA) return;
   // 캐시 폴더 이름은 앱 이름에서 나온다. 둘이 다를 수 있어 모두 살펴본다.
   const names = new Set([app.getName(), require('./package.json').name]);
   for (const name of names) {
@@ -658,6 +845,11 @@ if (!app.requestSingleInstanceLock()) {
     ipcMain.on('update:install', () => {
       if (!app.isPackaged || update.status !== 'ready') return;
       flushSave();                 // 기록을 먼저 디스크에 내린다
+      if (appPatch) {
+        swapAppPatch(true);        // 꺼지면 바꿔 끼우고 다시 켠다
+        app.quit();
+        return;
+      }
       autoUpdater.quitAndInstall();
     });
 
@@ -678,6 +870,7 @@ if (!app.requestSingleInstanceLock()) {
     if (checkTimer) { clearInterval(checkTimer); checkTimer = null; }
     closeWidget();
     flushSave();
+    swapAppPatch(false); // 받아둔 새 판이 있으면 끄는 김에 바꿔 끼운다
   });
   app.on('window-all-closed', () => {
     flushSave();
